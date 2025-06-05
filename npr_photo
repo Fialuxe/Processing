@@ -1,0 +1,279 @@
+/*
+* 画像をもとに点描する
+* 当pdeファイルと同一ディレクトリに処理ファイルを記載する前提で現状コードを記載
+* ディレクトリ構造はこんな感じ
+* thisfile/
+*  ├ thisfile.pde
+*  ├ tes3.png
+*  └ data/
+*    ├ blue_images/
+*    ├ gray_images/
+*    ├ green_images/
+*    └ red_images/
+*    
+* Gemini2.5 Pro利用。
+*/
+
+// グローバル変数
+PImage baseImage;
+PGraphics canvasGraphics; // アートワークを描画するオフスクリーンバッファ
+
+// エッジ情報用配列
+float[][] edgeMagnitude;
+float[][] edgeAngle;
+float maxEdgeMagnitude = 0.0f; // エッジ強度の最大値（正規化用）
+
+// 配置用画像のリスト
+ArrayList<PImage> redGroupImages;
+ArrayList<PImage> greenGroupImages;
+ArrayList<PImage> blueGroupImages;
+ArrayList<PImage> grayGroupImages;
+
+// --- 調整可能なパラメータ ---
+int NUM_WRITE = 30000; // 配置する画像の数
+float minAlpha = 120;   // 配置画像の最小アルファ値 (0-255)
+float maxAlpha = 180;
+float defaultElementSize = 50; // 配置画像の基本サイズ (ピクセル単位)
+float sizeScaleFactor = 25;    // エッジ強度によるサイズ変化の最大量 (ピクセル単位)
+boolean invertSizeWithEdge = false; // true: エッジ大→サイズ大, false: エッジ大→サイズ小
+
+// choosePhoto関数で無彩色と判定するための閾値
+float saturationThreshold = 30; // この彩度以下を無彩色とみなす (0-255)
+float brightnessThresholdLow = 30;  // この明度以下を無彩色とみなす (0-255)
+float brightnessThresholdHigh = 225; // この明度以上を無彩色とみなす (0-255)
+// --- パラメータここまで ---
+
+void setup() {
+  // ベース画像の読み込み
+  baseImage = loadImage("tes3.png");
+  if (baseImage == null) {
+    println("Error: Base image 'image.png' not found or could not be loaded.");
+    println("Please make sure 'image.png' is in the sketch folder.");
+    exit();
+  }
+  
+  size(1920, 1080);
+  
+  // PGraphicsの初期化
+  canvasGraphics = createGraphics(baseImage.width, baseImage.height);
+
+  // エッジ情報の計算
+  println("Calculating Sobel maps...");
+  calculateSobelMaps(baseImage);
+  println("Sobel maps calculated. Max edge magnitude: " + maxEdgeMagnitude);
+
+  // 配置用画像の読み込み
+  println("Loading element images...");
+  // !!! 下のファイルパスリストを、ご自身で用意した画像に合わせて変更してください !!!
+  String[] redImagePaths = {
+    "red_flower.png", "red_flower2.png", "white_cherryblossom.png" // 例: data/red_images/sakura.png など
+  };
+  String[] greenImagePaths = {
+    "yellow_flower.png" // 例: data/green_images/leaf.png など
+  };
+  String[] blueImagePaths = {
+    "blue_flower.png, blue_blossom.png" //など
+  };
+  String[] grayImagePaths = {
+    "white_cherryblossom.png" // 例: data/gray_images/stone.png など
+  };
+
+  redGroupImages = loadImagesFromGroup("red_images", redImagePaths);
+  greenGroupImages = loadImagesFromGroup("green_images", greenImagePaths);
+  blueGroupImages = loadImagesFromGroup("blue_images", blueImagePaths);
+  grayGroupImages = loadImagesFromGroup("gray_images", grayImagePaths);
+  println("Element images loaded.");
+
+  // アートワーク生成 (一度だけ実行)
+  println("Generating artwork...");
+  generateArtwork();
+  println("Artwork generation complete. Press 's' to save.");
+  
+  noLoop(); // draw()は一度だけ描画内容を更新するために使う
+}
+
+void draw() {
+  // 完成したアートワークを表示
+  image(canvasGraphics, 0, 0);
+}
+
+void keyPressed() {
+  if (key == 's' || key == 'S') {
+    String timestamp = year() + nf(month(),2) + nf(day(),2) + "_" + nf(hour(),2) + nf(minute(),2) + nf(second(),2);
+    canvasGraphics.save("output_" + timestamp + ".png");
+    println("Image saved as output_" + timestamp + ".png");
+  }
+}
+
+// アートワークを生成するメインの処理
+void generateArtwork() {
+  canvasGraphics.beginDraw();
+  canvasGraphics.image(baseImage, 0, 0); // ベース画像を背景としてコピー
+
+  for (int i = 0; i < NUM_WRITE; i++) {
+    // ランダムな点を取得
+    int x = int(random(baseImage.width));
+    int y = int(random(baseImage.height));
+
+    // エッジ情報を取得 (配列外参照を避けるため、境界は丸める)
+    int clampedX = constrain(x, 0, baseImage.width - 1);
+    int clampedY = constrain(y, 0, baseImage.height - 1);
+    
+    float currentEdgeMag = edgeMagnitude[clampedX][clampedY]; // 正規化済み (0.0 - 1.0)
+    float currentEdgeAng = edgeAngle[clampedX][clampedY];
+
+    // ベース画像の色を取得
+    color baseColorAtPoint = baseImage.get(clampedX, clampedY);
+    float r = red(baseColorAtPoint);
+    float g = green(baseColorAtPoint);
+    float b = blue(baseColorAtPoint);
+
+    // 配置する画像を選択
+    PImage photoToPlace = choosePhoto(r, g, b);
+    if (photoToPlace == null) {
+      //println("Skipping placement, no suitable photo found for color R:" + int(r) + " G:" + int(g) + " B:" + int(b));
+      continue; // 適切な画像が見つからなければスキップ
+    }
+
+    // サイズ調整
+    float scaledSize;
+    if (invertSizeWithEdge) {
+      scaledSize = defaultElementSize + currentEdgeMag * sizeScaleFactor;
+    } else {
+      scaledSize = defaultElementSize - currentEdgeMag * sizeScaleFactor;
+    }
+    scaledSize = max(5, scaledSize); // 最小サイズ保証
+
+    // 透明度
+    float randomAlpha = random(minAlpha, maxAlpha);
+
+    // 画像を配置
+    canvasGraphics.pushMatrix();
+    canvasGraphics.translate(x, y);
+    canvasGraphics.rotate(currentEdgeAng);
+    canvasGraphics.imageMode(CENTER);
+    canvasGraphics.tint(r, g, b, randomAlpha);
+    
+    float aspectRatio = (float)photoToPlace.height / photoToPlace.width;
+    canvasGraphics.image(photoToPlace, 0, 0, scaledSize, scaledSize * aspectRatio);
+    
+    canvasGraphics.noTint(); // 次の描画のためにtintをリセット
+    canvasGraphics.popMatrix();
+    
+    if (i % (NUM_WRITE / 10) == 0 && i > 0) {
+        print("."); //進捗表示
+    }
+  }
+  println("\nArtwork elements placed.");
+  canvasGraphics.endDraw();
+}
+
+// Sobelフィルタでエッジ強度と方向を計算
+void calculateSobelMaps(PImage img) {
+  int w = img.width;
+  int h = img.height;
+  edgeMagnitude = new float[w][h];
+  edgeAngle = new float[w][h];
+  maxEdgeMagnitude = 0; // この計算での最大値をリセット
+
+  img.loadPixels(); // 高速アクセスのためにピクセル配列をロード
+
+  // Sobelオペレータカーネル
+  int[][] sobelXkernel = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
+  int[][] sobelYkernel = {{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}};
+
+  // 境界を除いたピクセルに対して計算 (1 から w-2, 1 から h-2)
+  for (int y = 1; y < h - 1; y++) {
+    for (int x = 1; x < w - 1; x++) {
+      float sumX = 0;
+      float sumY = 0;
+      float G = 0;
+
+      for (int ky = -1; ky <= 1; ky++) {
+        for (int kx = -1; kx <= 1; kx++) {
+          int pixelIndex = (y + ky) * w + (x + kx);
+          color c = img.pixels[pixelIndex];
+          float val = brightness(c); // 輝度値を使用
+
+          sumX += val * sobelXkernel[ky + 1][kx + 1];
+          sumY += val * sobelYkernel[ky + 1][kx + 1];
+        }
+      }
+      G = sqrt(sumX * sumX + sumY * sumY);
+      edgeMagnitude[x][y] = G;
+      edgeAngle[x][y] = atan2(sumY, sumX) + PI / 2;
+
+      if (G > maxEdgeMagnitude) {
+        maxEdgeMagnitude = G;
+      }
+    }
+  }
+  
+  // エッジ強度を 0.0 - 1.0 の範囲に正規化 (maxEdgeMagnitudeが0でない場合)
+  if (maxEdgeMagnitude > 0) {
+    for (int y = 0; y < h; y++) { // 境界も含む全ピクセルを正規化(境界は0のまま)
+      for (int x = 0; x < w; x++) {
+        edgeMagnitude[x][y] /= maxEdgeMagnitude;
+      }
+    }
+  }
+  img.updatePixels(); // 使用した場合は必要だが、ここでは読み取り専用
+}
+
+// 指定されたグループ名(フォルダ名)とファイル名リストから画像を読み込むヘルパー関数
+ArrayList<PImage> loadImagesFromGroup(String groupFolderName, String[] fileNames) {
+  ArrayList<PImage> images = new ArrayList<PImage>();
+  if (fileNames == null || fileNames.length == 0) {
+    println("Warning: No file names provided for group: " + groupFolderName);
+    return images;
+  }
+  
+  println("Loading images for group: " + groupFolderName);
+  for (String fileName : fileNames) {
+    String path = "data/" + groupFolderName + "/" + fileName; // dataフォルダ内のグループフォルダを想定
+    PImage img = loadImage(path);
+    if (img != null) {
+      images.add(img);
+      println("  Loaded: " + path);
+    } else {
+      println("  Warning: Could not load image at path: " + path);
+    }
+  }
+  if (images.isEmpty()) {
+      println("Warning: No images successfully loaded for group: " + groupFolderName + ". This group will be unusable.");
+  }
+  return images;
+}
+
+// RGB値に基づいて適切な画像を選択する関数
+PImage choosePhoto(float r, float g, float b) {
+  color c = color(r, g, b);
+  float sat = saturation(c);
+  float br = brightness(c);
+
+  // 無彩色の判定
+  if (sat < saturationThreshold || br < brightnessThresholdLow || br > brightnessThresholdHigh) {
+    if (!grayGroupImages.isEmpty()) {
+      return grayGroupImages.get(int(random(grayGroupImages.size())));
+    }
+  }
+
+  // 有彩色の判定 (最も強い色成分)
+  if (r > g && r > b && !redGroupImages.isEmpty()) { // 赤系
+    return redGroupImages.get(int(random(redGroupImages.size())));
+  } else if (g > r && g > b && !greenGroupImages.isEmpty()) { // 緑系
+    return greenGroupImages.get(int(random(greenGroupImages.size())));
+  } else if (b > r && b > g && !blueGroupImages.isEmpty()) { // 青系
+    return blueGroupImages.get(int(random(blueGroupImages.size())));
+  }
+  
+  // フォールバック: 優先順位 (無彩色 -> 赤 -> 緑 -> 青 -> なし)
+  // 上記で既に選択されているはずだが、万が一すり抜けた場合や、
+  // 例えば赤が最も強いがredGroupImagesが空だった場合などに対応
+  if (!grayGroupImages.isEmpty()) return grayGroupImages.get(int(random(grayGroupImages.size())));
+  if (!redGroupImages.isEmpty()) return redGroupImages.get(int(random(redGroupImages.size())));
+  if (!greenGroupImages.isEmpty()) return greenGroupImages.get(int(random(greenGroupImages.size())));
+  if (!blueGroupImages.isEmpty()) return blueGroupImages.get(int(random(blueGroupImages.size())));
+  
+  return null; // どのグループにも画像がない場合
+}
